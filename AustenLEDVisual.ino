@@ -6,6 +6,7 @@
 #include <SPI.h>
 #include <PubSubClient.h>
 #include <vector>
+#define UNUSED(x) (void)x
 
 //Secrets
 #define OTA_PASSWORD ""
@@ -141,15 +142,13 @@ bool is_topic(const char* t, const char *tt){
 }
 
 void mqtt_callback(char *topic, uint8_t* payload, uint32_t len) {
+  UNUSED(payload);
+  UNUSED(len);
   Serial.print("MQTT: ");
   Serial.println(topic);
-  uint8_t *safe_buffer = new uint8_t[len+1];
-  memcpy(safe_buffer, payload, len);
-  safe_buffer[len] = '\0';
   if (is_topic(topic, MQTT_ORDERS)) {
     advance_visual(false);
     timer = millis();
-    Serial.println(atoi((char*)safe_buffer));
   }
 }
 
