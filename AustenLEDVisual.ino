@@ -6,18 +6,20 @@
 #include <SPI.h>
 #include <PubSubClient.h>
 #include <vector>
-
+#define UNUSED(x) (void)x
 //Secrets
 #define OTA_PASSWORD ""
 #define OTA_HOSTNAME ""
 const String ssid = "";//SET THIS
 const String password = "";//SET THIS
+const String domain = "local";
 
 //MQTT SETUP (set these)
 #define MQTT_CLIENT_NAME ""
-#define MQTT_SERVER      ""
-#define MQTT_SERVERPORT  1883                   // use 8883 for SSL
-const char* MQTT_ORDERS = "";
+#define MQTT_HOSTNAME ""
+#define MQTT_IP ""
+#define MQTT_PORT 1883 // use 8883 for SSL
+const char* MQTT_ORDERS = "levelup/visualization/order";
 
 //WATCHDOG SETUP
 //SimpleTimer watchdog;
@@ -28,6 +30,7 @@ void check_watchdog(uint8_t &errors) {
   if (errors > MAX_ERRORS) {
     Serial.println("!!");
     Serial.println("Watchdog: Too many Errors, rebooting...");
+    pinMode(0, INPUT_PULLUP);
     ESP.restart();
   }
 }
@@ -64,7 +67,7 @@ bool wifi_connect() {
 }
 
 //LED STRIP SETUP
-#define NLEDS 148
+#define NLEDS 160
 #define SCL 14
 #define MOSI 13
 
@@ -84,45 +87,71 @@ const CRGB NinjaOrange     = { 255, 32, 0 };
 
 const CRGB* colors[] = { &MidnightBlack,
   &SoothingGreen,
-  &AtomicLime,
-  &TangoRed,
+  //&AtomicLime,
+  //&TangoRed,
   &GalacticBlue,
-  &PurpleHaze,
-  &YellowSubmarine,
-  &ArcticTeal,
-  &SickFlamingo,
-  &MintJulep,
-  &NinjaOrange, };
+  //&PurpleHaze,
+  //&YellowSubmarine,
+  //&ArcticTeal,
+  //&SickFlamingo,
+  //&MintJulep,
+  &NinjaOrange, 
+};
 
 bool led_enable;
 std::vector<const CRGB*> lights;
-#define LIGHT_ADVANCE_RATE 250
-#define BRIGHTNESS 32
+
+#define MAX_LIGHT_ADVANCE_PERIOD 5000
+#define LIGHT_ADVANCE_DAMPING 75
+
+#define BRIGHTNESS 24
+uint32_t pixel_period = MAX_LIGHT_ADVANCE_PERIOD; 
+uint32_t timer = 0; //milliseconds at last pixel
+uint32_t color_index = 0;
+  
+void shift_pixel(bool blank) {
+  if(!blank) {
+    color_index += 1;
+    if (color_index >= (sizeof(colors)/sizeof(const CRGB*))) {
+      color_index = 1;
+    }
+    lights.insert(lights.begin(), colors[color_index]);
+    if (pixel_period > (millis() - timer))
+      pixel_period = millis() - timer;
+  } else {
+      if (pixel_period < MAX_LIGHT_ADVANCE_PERIOD)
+        pixel_period += LIGHT_ADVANCE_DAMPING;
+      lights.insert(lights.begin(), colors[0]);
+  }
+  timer = millis();
+}
 
 void update_leds() {
-  if (lights.size() > NLEDS)
-    lights.erase(lights.begin()+NLEDS, lights.end());
+  const CRGB *next_color;
+  const CRGB *this_color;
   
-  for(uint32_t i = 0; i < lights.size(); ++i) {
-    leds[i] = *(lights[i]);
+  if (pixel_period == 0) pixel_period = 1;
+  uint16_t fade = ((millis() - timer) << 8) / pixel_period;
+  if (fade > 255) {
+    shift_pixel(true);
+  }
+  if (lights.size() < 2) return;
+  if (lights.size() > NLEDS+1)
+    lights.erase(lights.begin()+NLEDS+1, lights.end());
+  
+  Serial.printf("Virtual pixel shift %d\n", fade);
+  next_color = lights[0];
+  for(uint32_t i = 1; i < lights.size(); ++i) {
+    //Perform a flow interpolation
+    this_color = next_color;
+    next_color = lights[i];
+    leds[i] = blend(*this_color,*next_color, 255-fade);
   }
   FastLED.show();
 }
 
-uint32_t timer = 0;
-
-void advance_visual(bool blank) {
-  uint32_t index;
-  if (blank) {
-    index = 0;
-  } else {
-    index = 1 + rand() % ((sizeof(colors)/sizeof(CRGB*))-1);
-  }
-  lights.insert(lights.begin(), colors[index]);
-}
-
 //MQTT
-PubSubClient client(MQTT_SERVER, MQTT_SERVERPORT, mqtt_callback, wifi);
+PubSubClient client(wifi);
 
 bool mqtt_connect() {
   if (client.connected())
@@ -141,15 +170,10 @@ bool is_topic(const char* t, const char *tt){
 }
 
 void mqtt_callback(char *topic, uint8_t* payload, uint32_t len) {
-  Serial.print("MQTT: ");
-  Serial.println(topic);
-  uint8_t *safe_buffer = new uint8_t[len+1];
-  memcpy(safe_buffer, payload, len);
-  safe_buffer[len] = '\0';
+  UNUSED(payload);
+  UNUSED(len);
   if (is_topic(topic, MQTT_ORDERS)) {
-    advance_visual(false);
-    timer = millis();
-    Serial.println(atoi((char*)safe_buffer));
+    shift_pixel(false);
   }
 }
 
@@ -198,6 +222,8 @@ void connect_all() {
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
   Serial.print("Connecting MQTT...");
+  client.setServer(MQTT_IP, MQTT_PORT);
+  client.setCallback(mqtt_callback);
   while (!mqtt_connect()){
     ++error_count;
     check_watchdog(error_count);
@@ -211,7 +237,7 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Boot");
   
-  LEDS.addLeds<LPD8806, MOSI, SCL, GRB, DATA_RATE_MHZ(2)>(leds, NLEDS).setCorrection(TypicalLEDStrip);
+  LEDS.addLeds<LPD8806, MOSI, SCL, BRG, DATA_RATE_MHZ(2)>(leds, NLEDS).setCorrection(TypicalLEDStrip);
   FastLED.setBrightness(BRIGHTNESS);
   connect_all();
   
@@ -224,10 +250,6 @@ void loop() {
   ArduinoOTA.handle();
   pet_watchdog();
   client.loop();
-  if ((millis() - timer) > LIGHT_ADVANCE_RATE) {
-    advance_visual(true);
-    timer = millis();
-  }
   update_leds();
 }
 
