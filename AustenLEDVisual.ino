@@ -1,6 +1,6 @@
 #include <FastLED.h>
 #include <ESP8266WiFi.h>
-#include <ESP8266mDNS.h>
+#include <mdns.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <SPI.h>
@@ -12,14 +12,15 @@
 #define OTA_HOSTNAME ""
 const String ssid = "";//SET THIS
 const String password = "";//SET THIS
-const String domain = "local";
+const String domain = "";
+IPAddress local_dns_ip = {0, 0, 0, 0};
 
 //MQTT SETUP (set these)
 #define MQTT_CLIENT_NAME ""
 #define MQTT_HOSTNAME ""
 #define MQTT_IP ""
 #define MQTT_PORT 1883 // use 8883 for SSL
-const char* MQTT_ORDERS = "levelup/visualization/order";
+const char* MQTT_ORDERS = "";
 
 //WATCHDOG SETUP
 //SimpleTimer watchdog;
@@ -53,6 +54,9 @@ void pet_watchdog() {
 
 //WIFI SETUP
 WiFiClient wifi;
+WiFiUDP udp;
+IPAddress mqtt_ip;
+#define MDNS_TIMEOUT 12000
 
 bool wifi_connect() {
   if (wifi.connected()) {
@@ -65,6 +69,19 @@ bool wifi_connect() {
   }
   return false;
 }
+
+bool mdns_addr_found = false;
+void mdnsCallback(const mdns::Answer* answer) {
+  if(strcmp(answer->name_buffer, MQTT_HOSTNAME) == 0) {
+    Serial.printf("Found %s (", answer->name_buffer);
+    Serial.print(answer->rdata_buffer);
+    Serial.println(")");
+    mdns_addr_found = true;
+    mqtt_ip.fromString(answer->rdata_buffer);
+  }
+}
+
+mdns::MDns responder(NULL, NULL, mdnsCallback);
 
 //LED STRIP SETUP
 #define NLEDS 160
@@ -102,7 +119,7 @@ bool led_enable;
 std::vector<const CRGB*> lights;
 
 #define MAX_LIGHT_ADVANCE_PERIOD 5000
-#define LIGHT_ADVANCE_DAMPING 75
+#define LIGHT_ADVANCE_DAMPING 5
 
 #define BRIGHTNESS 24
 uint32_t pixel_period = MAX_LIGHT_ADVANCE_PERIOD; 
@@ -127,25 +144,29 @@ void shift_pixel(bool blank) {
 }
 
 void update_leds() {
-  const CRGB *next_color;
-  const CRGB *this_color;
+  const CRGB *old_color;
+  const CRGB *new_color;
   
   if (pixel_period == 0) pixel_period = 1;
   uint16_t fade = ((millis() - timer) << 8) / pixel_period;
   if (fade > 255) {
     shift_pixel(true);
   }
+  if (lights.size() < 1) return;
+  leds[0] = blend(CRGB(0), *lights[0], fade);
   if (lights.size() < 2) return;
   if (lights.size() > NLEDS+1)
     lights.erase(lights.begin()+NLEDS+1, lights.end());
   
   Serial.printf("Virtual pixel shift %d\n", fade);
-  next_color = lights[0];
+  
+  new_color = lights[0];
+  
   for(uint32_t i = 1; i < lights.size(); ++i) {
     //Perform a flow interpolation
-    this_color = next_color;
-    next_color = lights[i];
-    leds[i] = blend(*this_color,*next_color, 255-fade);
+    old_color = lights[i];
+    leds[i] = blend(*old_color,*new_color, fade);
+    new_color = old_color;
   }
   FastLED.show();
 }
@@ -207,7 +228,7 @@ void setup_ota() {
   });
   ArduinoOTA.begin();
 }
-  
+
 //==ENTRY==
 void connect_all() {
   uint8_t error_count = 0;
@@ -221,9 +242,47 @@ void connect_all() {
   Serial.println("Ok");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
+  WiFi.config(WiFi.localIP(), local_dns_ip, IPAddress({255, 255, 255, 0}), local_dns_ip);
   Serial.print("Connecting MQTT...");
-  client.setServer(MQTT_IP, MQTT_PORT);
+  while(udp.parsePacket() > 0);
+  int res = WiFi.hostByName(MQTT_HOSTNAME, mqtt_ip);
+  if (res == 1) {
+    Serial.println(mqtt_ip);
+    client.setServer(mqtt_ip, MQTT_PORT);
+  } else {
+    Serial.print(res);
+    Serial.println("X, using mDNS");
+    Serial.printf("mDNS (%s)...", MQTT_HOSTNAME);
+    int query_time = MDNS_TIMEOUT + millis();
+    mdns::Query q;
+    int len = strlen(MQTT_HOSTNAME);
+    strcpy(q.qname_buffer, MQTT_HOSTNAME);
+    q.qname_buffer[len] = '\0';
+    Serial.printf("Querying |%s|...", q.qname_buffer);
+    q.qtype = 0x01;
+    q.qclass = 0x01;
+    q.unicast_response = 0;
+    q.valid = 0;
+    responder.Clear();
+    responder.AddQuery(q);
+    responder.Send();
+    while(query_time > millis()) {
+      responder.Check();
+      if(mdns_addr_found) {
+        break;
+      }
+    }
+    if(!mdns_addr_found) {
+      Serial.print("X, using hardcoded IP ");
+      Serial.println(MQTT_IP);
+      client.setServer(MQTT_IP, MQTT_PORT);
+    } else {
+      Serial.println(mqtt_ip);
+      client.setServer(mqtt_ip, MQTT_PORT);
+    }
+  }
   client.setCallback(mqtt_callback);
+  Serial.print("MQTT handshake...");
   while (!mqtt_connect()){
     ++error_count;
     check_watchdog(error_count);
