@@ -1,13 +1,11 @@
 #include <FastLED.h>
 #include <ESP8266WiFi.h>
-#include <mdns.h>
+#include <mDNSResolver.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <SPI.h>
 #include <PubSubClient.h>
 #include <vector>
-
-#include <ESP8266Ping.h>
 
 #define UNUSED(x) (void)x
 //Secrets
@@ -24,11 +22,12 @@ const String domain = "local";
 #define MQTT_PORT 1883 // use 8883 for SSL
 const char* MQTT_ORDERS = "";
 
+bool mqtt_led = false;
+
 //WIFI SETUP
 WiFiClient wifi;
 WiFiUDP udp;
 IPAddress mqtt_ip;
-#define MDNS_TIMEOUT 12000
 
 bool wifi_connect() {
   delay(10);
@@ -168,12 +167,15 @@ void update_leds() {
 PubSubClient client(wifi);
 String clientId;
 void mqtt_connect() {
-  Serial.printf("Connecting as %s\n", clientId.c_str());
   while (!client.connected()) {
+    Serial.printf("Connecting as %s\n", clientId.c_str());
     if (client.connect(clientId.c_str())){
       Serial.println("MQTT Connected");
-      client.subscribe(MQTT_ORDERS);
-      Serial.printf("Subscribed to %s\n", MQTT_ORDERS);
+      if (client.subscribe(MQTT_ORDERS,1)) {
+        Serial.printf("Subscribed to %s\n", MQTT_ORDERS);
+      } else {
+        Serial.printf("Subscription to %s failed\n", MQTT_ORDERS);
+      }
     } else {
       Serial.print("Failed rc:");
       Serial.println(client.state());
@@ -192,20 +194,9 @@ void mqtt_callback(char *topic, uint8_t* payload, uint32_t len) {
   UNUSED(payload);
   UNUSED(len);
   if (is_topic(topic, MQTT_ORDERS)) {
-    Serial.println("Got Order!");
+    digitalWrite(0, mqtt_led ? HIGH : LOW);
+    mqtt_led = !mqtt_led;
     shift_pixel(false);
-  }
-}
-
-//mDNS setup
-bool mdns_addr_found = false;
-void mdnsCallback(const mdns::Answer* answer) {
-  if(strcmp(answer->name_buffer, MQTT_HOSTNAME) == 0) {
-    Serial.printf("Found %s (", answer->name_buffer);
-    Serial.print(answer->rdata_buffer);
-    Serial.println(")");
-    mdns_addr_found = true;
-    mqtt_ip.fromString(answer->rdata_buffer);
   }
 }
 
@@ -241,48 +232,27 @@ void setup_ota() {
 }
 
 //==ENTRY==
-void connect_all() {
+void setup_connections() {
   uint8_t error_count = 0;
   wifi_connect();
   Serial.print("Connecting MQTT...");
   while(udp.parsePacket() > 0);
   int res = WiFi.hostByName(MQTT_HOSTNAME, mqtt_ip);
   if (res != 1) {
-    Serial.print(res);
-    Serial.println("X, using mDNS");
-    Serial.printf("mDNS (%s)...", MQTT_HOSTNAME);
-    mdns::MDns responder(NULL, NULL, mdnsCallback);
-    int query_time = MDNS_TIMEOUT + millis();
-    mdns::Query q;
-    int len = strlen(MQTT_HOSTNAME);
-    strcpy(q.qname_buffer, MQTT_HOSTNAME);
-    q.qname_buffer[len] = '\0';
-    Serial.printf("Querying \"%s\"...", q.qname_buffer);
-    q.qtype = 0x01;
-    q.qclass = 0x01;
-    q.unicast_response = 0;
-    q.valid = 0;
-    responder.Clear();
-    responder.AddQuery(q);
-    responder.Send();
-    while(query_time > millis()) {
-      responder.loop();
-      if(mdns_addr_found) {
-        break;
-      }
-    }
-    if(!mdns_addr_found) {
+    mDNSResolver::Resolver resolver(udp);
+    resolver.setLocalIP(WiFi.localIP());
+    mqtt_ip = resolver.search(MQTT_HOSTNAME);
+    if(mqtt_ip == INADDR_NONE) {
       //HARDCODED IP
+      Serial.print("Failing back to hardcoded IP");
       mqtt_ip.fromString(MQTT_IP);
     } 
-    
   }
   Serial.println(mqtt_ip);
   clientId = MQTT_CLIENT_NAME;
   clientId += String(random(0xffff), HEX);
   client.setServer(mqtt_ip, MQTT_PORT);
   client.setCallback(mqtt_callback);
-  
   udp.stop();
 }
 
@@ -290,23 +260,20 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Boot");
   
+  pinMode(0, OUTPUT);
+  digitalWrite(0, LOW);
   LEDS.addLeds<LPD8806, MOSI, SCL, BRG, DATA_RATE_MHZ(2)>(leds, NLEDS).setCorrection(TypicalLEDStrip);
   FastLED.setBrightness(BRIGHTNESS);
-  connect_all();
+  setup_connections();
   
   setup_ota();
   timer = millis();
-  Serial.printf("Wifi Ping of MQTT server: %d\n", Ping.ping(mqtt_ip, 10));
-  Serial.printf("Wifi Ping of Google.com: %d\n", Ping.ping("www.google.com", 10));
-  
   Serial.println("System Up");
 }
 
 void loop() {
   ArduinoOTA.handle();
-  if (!client.connected()) {
-    mqtt_connect();
-  }
+  mqtt_connect();
   client.loop();
   update_leds();
 }
