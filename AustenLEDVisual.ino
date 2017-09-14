@@ -6,14 +6,16 @@
 #include <SPI.h>
 #include <PubSubClient.h>
 #include <vector>
+
+#include <ESP8266Ping.h>
+
 #define UNUSED(x) (void)x
 //Secrets
 #define OTA_PASSWORD ""
 #define OTA_HOSTNAME ""
 const String ssid = "";//SET THIS
 const String password = "";//SET THIS
-const String domain = "";
-IPAddress local_dns_ip = {0, 0, 0, 0};
+const String domain = "local";
 
 //MQTT SETUP (set these)
 #define MQTT_CLIENT_NAME ""
@@ -22,36 +24,6 @@ IPAddress local_dns_ip = {0, 0, 0, 0};
 #define MQTT_PORT 1883 // use 8883 for SSL
 const char* MQTT_ORDERS = "";
 
-//WATCHDOG SETUP
-//SimpleTimer watchdog;
-#define MAX_ERRORS 3
-#define DELAY 3000
-
-void check_watchdog(uint8_t &errors) {
-  if (errors > MAX_ERRORS) {
-    Serial.println("!!");
-    Serial.println("Watchdog: Too many Errors, rebooting...");
-    pinMode(0, INPUT_PULLUP);
-    ESP.restart();
-  }
-}
-
-void pet_watchdog() {
-  uint8_t error_count = 0;
-  while (!wifi_connect()) {
-    ++error_count;
-    check_watchdog(error_count);
-    Serial.println("WiFi failure");
-    delay(DELAY);
-  }
-  while (!mqtt_connect()){
-    ++error_count;
-    check_watchdog(error_count);
-    Serial.println("MQTT failure");
-    delay(DELAY);
-  }
-}
-
 //WIFI SETUP
 WiFiClient wifi;
 WiFiUDP udp;
@@ -59,29 +31,52 @@ IPAddress mqtt_ip;
 #define MDNS_TIMEOUT 12000
 
 bool wifi_connect() {
-  if (wifi.connected()) {
-    return true;
-  }
-  WiFi.mode(WIFI_STA);
+  delay(10);
+  //WiFi.mode(WIFI_STA) ;
+  Serial.printf("Connecting to %s", ssid.c_str());
   WiFi.begin(ssid.c_str(), password.c_str());
-  if (WiFi.waitForConnectResult() == WL_CONNECTED) {
-    return true;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
   }
-  return false;
+  Serial.print(WiFi.localIP());
+  Serial.print(" (");
+  Serial.print(WiFi.subnetMask());
+  Serial.println(")");
+  return wifi.connected();
 }
 
-bool mdns_addr_found = false;
-void mdnsCallback(const mdns::Answer* answer) {
-  if(strcmp(answer->name_buffer, MQTT_HOSTNAME) == 0) {
-    Serial.printf("Found %s (", answer->name_buffer);
-    Serial.print(answer->rdata_buffer);
-    Serial.println(")");
-    mdns_addr_found = true;
-    mqtt_ip.fromString(answer->rdata_buffer);
+void print_wifi_status(int s) {
+  switch(s) {
+    case WL_CONNECTED:
+      Serial.println("CONNECTED");
+      break;
+    case WL_NO_SHIELD:
+      Serial.println("NO SHEILD");
+      break;
+    case WL_IDLE_STATUS:
+      Serial.println("IDLE STATUS");
+      break;
+    case WL_NO_SSID_AVAIL:
+      Serial.println("NO SSID AVAIL");
+      break;
+    case WL_SCAN_COMPLETED:
+      Serial.println("SCAN COMPLETED");
+      break;
+    case WL_CONNECT_FAILED:
+      Serial.println("CONNECT FAILED");
+      break;
+    case WL_CONNECTION_LOST:
+      Serial.println("CONNECTION LOST");
+      break;
+    case WL_DISCONNECTED:
+      Serial.println("DISCONNECTED");
+      break;
+    default:
+      Serial.println("Unknown Status");
+      break;
   }
 }
-
-mdns::MDns responder(NULL, NULL, mdnsCallback);
 
 //LED STRIP SETUP
 #define NLEDS 160
@@ -158,8 +153,6 @@ void update_leds() {
   if (lights.size() > NLEDS+1)
     lights.erase(lights.begin()+NLEDS+1, lights.end());
   
-  Serial.printf("Virtual pixel shift %d\n", fade);
-  
   new_color = lights[0];
   
   for(uint32_t i = 1; i < lights.size(); ++i) {
@@ -173,17 +166,22 @@ void update_leds() {
 
 //MQTT
 PubSubClient client(wifi);
-
-bool mqtt_connect() {
-  if (client.connected())
-  {
-    return true;
+String clientId;
+void mqtt_connect() {
+  Serial.printf("Connecting as %s\n", clientId.c_str());
+  while (!client.connected()) {
+    if (client.connect(clientId.c_str())){
+      Serial.println("MQTT Connected");
+      client.subscribe(MQTT_ORDERS);
+      Serial.printf("Subscribed to %s\n", MQTT_ORDERS);
+    } else {
+      Serial.print("Failed rc:");
+      Serial.println(client.state());
+      Serial.print("Network: ");
+      print_wifi_status(WiFi.status());
+      delay(5000);
+    }
   }
-  if (client.connect(MQTT_CLIENT_NAME)){
-    client.subscribe(MQTT_ORDERS);
-    return true;
-  }
-  return false;
 }
 
 bool is_topic(const char* t, const char *tt){
@@ -194,7 +192,20 @@ void mqtt_callback(char *topic, uint8_t* payload, uint32_t len) {
   UNUSED(payload);
   UNUSED(len);
   if (is_topic(topic, MQTT_ORDERS)) {
+    Serial.println("Got Order!");
     shift_pixel(false);
+  }
+}
+
+//mDNS setup
+bool mdns_addr_found = false;
+void mdnsCallback(const mdns::Answer* answer) {
+  if(strcmp(answer->name_buffer, MQTT_HOSTNAME) == 0) {
+    Serial.printf("Found %s (", answer->name_buffer);
+    Serial.print(answer->rdata_buffer);
+    Serial.println(")");
+    mdns_addr_found = true;
+    mqtt_ip.fromString(answer->rdata_buffer);
   }
 }
 
@@ -232,33 +243,21 @@ void setup_ota() {
 //==ENTRY==
 void connect_all() {
   uint8_t error_count = 0;
-  Serial.print("Connecting Wifi...");
-  while (!wifi_connect()) {
-    ++error_count;
-    check_watchdog(error_count);
-    Serial.print("X");
-    delay(DELAY);
-  }
-  Serial.println("Ok");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-  WiFi.config(WiFi.localIP(), local_dns_ip, IPAddress({255, 255, 255, 0}), local_dns_ip);
+  wifi_connect();
   Serial.print("Connecting MQTT...");
   while(udp.parsePacket() > 0);
   int res = WiFi.hostByName(MQTT_HOSTNAME, mqtt_ip);
-  if (res == 1) {
-    Serial.println(mqtt_ip);
-    client.setServer(mqtt_ip, MQTT_PORT);
-  } else {
+  if (res != 1) {
     Serial.print(res);
     Serial.println("X, using mDNS");
     Serial.printf("mDNS (%s)...", MQTT_HOSTNAME);
+    mdns::MDns responder(NULL, NULL, mdnsCallback);
     int query_time = MDNS_TIMEOUT + millis();
     mdns::Query q;
     int len = strlen(MQTT_HOSTNAME);
     strcpy(q.qname_buffer, MQTT_HOSTNAME);
     q.qname_buffer[len] = '\0';
-    Serial.printf("Querying |%s|...", q.qname_buffer);
+    Serial.printf("Querying \"%s\"...", q.qname_buffer);
     q.qtype = 0x01;
     q.qclass = 0x01;
     q.unicast_response = 0;
@@ -267,29 +266,24 @@ void connect_all() {
     responder.AddQuery(q);
     responder.Send();
     while(query_time > millis()) {
-      responder.Check();
+      responder.loop();
       if(mdns_addr_found) {
         break;
       }
     }
     if(!mdns_addr_found) {
-      Serial.print("X, using hardcoded IP ");
-      Serial.println(MQTT_IP);
-      client.setServer(MQTT_IP, MQTT_PORT);
-    } else {
-      Serial.println(mqtt_ip);
-      client.setServer(mqtt_ip, MQTT_PORT);
-    }
+      //HARDCODED IP
+      mqtt_ip.fromString(MQTT_IP);
+    } 
+    
   }
+  Serial.println(mqtt_ip);
+  clientId = MQTT_CLIENT_NAME;
+  clientId += String(random(0xffff), HEX);
+  client.setServer(mqtt_ip, MQTT_PORT);
   client.setCallback(mqtt_callback);
-  Serial.print("MQTT handshake...");
-  while (!mqtt_connect()){
-    ++error_count;
-    check_watchdog(error_count);
-    Serial.print("X");
-    delay(DELAY);
-  }
-  Serial.println("Ok");
+  
+  udp.stop();
 }
 
 void setup() {
@@ -302,12 +296,17 @@ void setup() {
   
   setup_ota();
   timer = millis();
+  Serial.printf("Wifi Ping of MQTT server: %d\n", Ping.ping(mqtt_ip, 10));
+  Serial.printf("Wifi Ping of Google.com: %d\n", Ping.ping("www.google.com", 10));
+  
   Serial.println("System Up");
 }
 
 void loop() {
   ArduinoOTA.handle();
-  pet_watchdog();
+  if (!client.connected()) {
+    mqtt_connect();
+  }
   client.loop();
   update_leds();
 }
